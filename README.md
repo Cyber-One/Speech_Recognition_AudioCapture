@@ -121,4 +121,6 @@ MIT License - See LICENSE file
 
 ## Authors
 
+Ray Edgley and Copilot.
 Developed as part of a modular speech recognition system for embedded platforms.
+
