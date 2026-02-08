@@ -56,8 +56,8 @@ Three microphones are placed in a line, 50mm (about 2 inches) apart.
 │  │ (beamformed) │    │  (5 beams) │    │ (FFT results)│        │
 │  └──────────────┘    └────────────┘    └──────────────┘        │
 │                      Q15 Fixed-Point                             │
-│                      20 freq bins                                │
-│                      500-5000 Hz                                 │
+│                      40 freq bins                                │
+│                      500-5500 Hz                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 Key Benefits:
@@ -75,7 +75,7 @@ When sound comes from a specific direction, it reaches the microphones at **slig
 ### The Frequency Analysis (FFT)
 FFT (Fast Fourier Transform) converts time-domain audio into **frequency-domain** representation:
 - Input: 256 audio samples over time
-- Output: 20 frequency bins representing power in each frequency range (500-5000 Hz)
+- Output: 40 frequency bins representing power in each frequency range (500-5500 Hz)
 - This range covers human speech well (formants, consonants, vowels)
 
 ---
@@ -179,7 +179,7 @@ picotool load build/Speech_Recognition_AudioCapture.uf2 -fx
 # The device will appear as a virtual COM port
 # Open with any serial monitor at 115200 baud (or just read the USB CDC output)
 # Tools: PuTTY, minicom, VS Code Serial Monitor extension, or any USB serial terminal
-# Output: 200 bytes per FFT cycle (5 beams × 20 bins × 2 bytes)
+# Output: 205 bytes per FFT cycle (5 beams × 41-byte packets)
 ```
 
 ### I2C Testing
@@ -223,7 +223,7 @@ picotool load build/Speech_Recognition_AudioCapture.uf2 -fx
 
 ### I2C Communication
 - Standard I2C protocol at 400 kHz
-- Packet: 41 bytes (0xAA header + 20 bins × 2 bytes)
+- Packet: 41 bytes (0xAA header + 40 bins × 1 byte)
 - **Handled by Core 0**: Transmission parallelized with Core 1's FFT computation
 - Core 1 queues FFT results; Core 0 transmits during its idle time
 - Blocking write (per packet); on NACK the corresponding error LED stays ON
@@ -374,3 +374,16 @@ Linked Pico SDK libraries:
 - `m` (libm): Math library (sin, cos, sqrt, etc.)
 
 ---
+
+## How it works (summary)
+
+- Core 0 continuously captures 3-channel ADC data via DMA at 16 kHz.
+- Core 0 performs delay-and-sum beamforming for 5 angles (-60°, -30°, 0°, +30°, +60°).
+- Core 1 runs a 256-point fixed-point FFT (Q15), computes magnitudes, and extracts 40 frequency bins.
+- Core 0 transmits the 40-bin packet over I2C to slaves at addresses 0x60–0x64.
+
+## Frequency bin centers (Hz)
+
+Derived from $f_s=16000$, $N=256$, start bin 8 (500 Hz), with 40 output bins formed by summing pairs of FFT bins across the 500–5500 Hz range. Approximate bin centers are:
+
+$$f_{bin}(n) = 500 + 125n\;\text{Hz},\quad n=0\ldots39$$

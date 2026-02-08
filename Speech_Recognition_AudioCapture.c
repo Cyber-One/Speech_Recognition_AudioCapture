@@ -57,10 +57,10 @@
 
 // FFT configuration for frequency analysis (Fixed-point Q15 implementation)
 #define FFT_SIZE 256              // 256-point FFT for frequency resolution
-#define NUM_FREQ_BINS 20          // Extract 20 frequency bins
+#define NUM_FREQ_BINS 40          // Extract 40 frequency bins
 #define FREQ_MIN 500              // 500 Hz lower bound
-#define FREQ_MAX 5000             // 5000 Hz upper bound
-#define BIN_WIDTH ((float)(FREQ_MAX - FREQ_MIN) / NUM_FREQ_BINS)  // ~225 Hz per bin
+#define FREQ_MAX 5500             // 5500 Hz upper bound
+#define BIN_WIDTH ((float)(FREQ_MAX - FREQ_MIN) / NUM_FREQ_BINS)  // ~125 Hz per bin
 
 // Fixed-point Q15 format (16-bit signed: -1.0 to 0.9999)
 #define Q15_SCALE 32767           // 2^15 - 1
@@ -84,7 +84,7 @@ static const int16_t twiddle_sin_lut[128] = {
 // Output buffers for each beamformed channel
 uint16_t beam_output[NUM_BEAMS][CAPTURE_DEPTH];
 
-// FFT output: 20 frequency bins for each of 5 beams
+// FFT output: 40 frequency bins for each of 5 beams
 uint16_t fft_output[NUM_BEAMS][NUM_FREQ_BINS];
 
 // FFT working buffers (fixed-point Q15)
@@ -130,7 +130,7 @@ static uint16_t local_beam_output[NUM_BEAMS][CAPTURE_DEPTH];
 #define DEBUG_FFT_COMPLETE_PIN 10  // Toggles on each FFT completion (5x per cycle)
 #define DEBUG_ALL_BEAMS_COMPLETE_PIN 11  // Toggles when all 5 beams complete (1x per cycle)
 
-// I2C packet format: 1 byte header + 20 bins * 2 bytes (40 bytes) = 41 bytes total
+// I2C packet format: 1 byte header + 40 bins * 1 byte (40 bytes) = 41 bytes total
 #define I2C_PACKET_HEADER 0xAA    // Packet header for identification
 #define I2C_PACKET_SIZE 41        // Header (1) + FFT bins (40)
 
@@ -396,26 +396,33 @@ static void fft_radix2(int16_t *real, int16_t *imag) {
     }
 }
 
-// Extract magnitude spectrum and map to 20 frequency bins
+// Extract magnitude spectrum and map to 40 frequency bins
 static void extract_freq_bins_fixed(uint16_t *magnitude, uint16_t *bins) {
     float bin_width_hz = (float)TARGET_SAMPLE_RATE / FFT_SIZE;
     int start_bin = (int)(FREQ_MIN / bin_width_hz);
     int end_bin = (int)(FREQ_MAX / bin_width_hz);
     int num_input_bins = end_bin - start_bin;
     
-    // Downsample from input bins to 20 output bins
+    // Noise floor threshold: suppress FFT magnitudes below this level
+    // This removes 12-bit ADC quantization noise while preserving real signals
+    const uint16_t NOISE_FLOOR = 25;  // Suppress quantization noise while preserving signals
+
+    
+    // Sum pairs of FFT bins to form 40 output bins (500 Hz to 5500 Hz)
+    // FFT bin width: 16k / 256 = 62.5 Hz, so 2 bins ≈ 125 Hz per output bin
     for (int out_bin = 0; out_bin < NUM_FREQ_BINS; out_bin++) {
-        // Linear interpolation across the input bins
-        float bin_idx = start_bin + (out_bin * (float)num_input_bins) / NUM_FREQ_BINS;
-        int bin_low = (int)bin_idx;
-        int bin_high = bin_low + 1;
-        float frac = bin_idx - bin_low;
-        
-        if (bin_high >= FFT_SIZE / 2) bin_high = FFT_SIZE / 2 - 1;
-        if (bin_low >= FFT_SIZE / 2) bin_low = FFT_SIZE / 2 - 1;
-        
-        // Linear interpolation
-        uint16_t val = (uint16_t)(magnitude[bin_low] * (1.0f - frac) + magnitude[bin_high] * frac);
+        int bin_base = start_bin + (out_bin * 2);
+        if (bin_base < 0) bin_base = 0;
+        if (bin_base >= (FFT_SIZE / 2 - 1)) bin_base = (FFT_SIZE / 2 - 2);
+
+        uint32_t sum = (uint32_t)magnitude[bin_base] + (uint32_t)magnitude[bin_base + 1];
+        uint16_t val = (sum > 65535) ? 65535 : (uint16_t)sum;
+
+        // Apply noise floor: suppress weak signals that are likely noise
+        if (val < NOISE_FLOOR) {
+            val = 0;
+        }
+
         bins[out_bin] = val;
     }
 }
@@ -424,8 +431,11 @@ static void extract_freq_bins_fixed(uint16_t *magnitude, uint16_t *bins) {
 static void compute_fft_spectrum(uint16_t *input, uint16_t *output) {
     // Prepare input: convert to fixed-point Q15
     for (int i = 0; i < FFT_SIZE; i++) {
-        // Scale 12-bit ADC value (0-4095) to Q15 range
-        int16_t adc_q15 = (int16_t)((input[i] << 3) - 16384);  // Center around 0
+        // Beamformed output is uint16_t (0-4095 range from 12-bit ADC)
+        // Convert to signed Q15: center around 0 and scale up
+        // Range: 0-4095 → -2048 to +2047 → -32768 to +32752 in Q15
+        int32_t centered = (int32_t)input[i] - 2048;
+        int16_t adc_q15 = (int16_t)(centered * 16);  // Scale by ~16 to use full Q15 range
         fft_real[i] = adc_q15;
         fft_imag[i] = 0;
     }
@@ -452,10 +462,13 @@ static void compute_fft_spectrum(uint16_t *input, uint16_t *output) {
         x = (x + mag / x) >> 1;
         x = (x + mag / x) >> 1;
         
-        fft_magnitude[i] = (uint16_t)(x >> 16);  // Scale down to 16-bit
+        // Scale down: >> 8 keeps magnitude in reasonable range for 12-bit ADC input
+        // Original >> 16 was too aggressive, losing signal information
+        uint32_t scaled = x >> 8;
+        fft_magnitude[i] = (uint16_t)(scaled > 65535 ? 65535 : scaled);  // Cap at 16-bit max
     }
     
-    // Extract 20 frequency bins
+    // Extract 40 frequency bins
     extract_freq_bins_fixed(fft_magnitude, output);
 }
 
@@ -515,12 +528,20 @@ static void init_debug_gpios(void) {
     fflush(stdout);
 }
 
-// Format I2C packet: header + 20 frequency bins (2 bytes each)
+// Format I2C packet: header + 40 frequency bins (1 byte each)
 static void format_i2c_packet(uint16_t *freq_bins) {
     i2c_packet[0] = I2C_PACKET_HEADER;
     for (int i = 0; i < NUM_FREQ_BINS; i++) {
-        i2c_packet[1 + i * 2] = (freq_bins[i] >> 8) & 0xFF;      // MSB
-        i2c_packet[2 + i * 2] = freq_bins[i] & 0xFF;             // LSB
+        // Convert 16-bit magnitude to 8-bit by right shifting
+        uint16_t val = freq_bins[i];
+        uint8_t out = (uint8_t)(val >> 8);
+        i2c_packet[1 + i] = out;
+    }
+    // Debug: log packet formatting (first time only)
+    static bool logged = false;
+    if (!logged) {
+        fflush(stdout);
+        logged = true;
     }
 }
 
@@ -557,8 +578,8 @@ static bool send_fft_via_i2c(int beam_idx, uint16_t *freq_bins) {
             gpio_put(error_pins[beam_idx], 1);  // Turn ON LED to indicate failure
         }
         // Debug: print I2C error to serial
-        //printf("I2C Beam %d (addr 0x%02x) failed: result=%d (expected %d)\n", beam_idx, slave_addr, result, I2C_PACKET_SIZE);
-        //fflush(stdout);
+        printf("I2C Beam %d (addr 0x%02x) failed: result=%d (expected %d)\n", beam_idx, slave_addr, result, I2C_PACKET_SIZE);
+        fflush(stdout);
         return false;
     }
 }
@@ -580,14 +601,7 @@ static void core1_main(void) {
     while (true) {
         // Wait for beamformed data from Core 0 (non-blocking check)
         if (queue_get_beamformed(local_beam_data)) {
-            // Got a block! Process it.
             cycle_count++;
-            
-            // Print status every 100 cycles (~1.5 seconds at 62 Hz)
-            if ((cycle_count % 100) == 0) {
-                printf("Core1: %u cycles, %u FFT queue full\n", cycle_count, fft_queue_full_count);
-                fflush(stdout);
-            }
             
             // All 5 beams FFT Start - toggle GPIO 11 as pulse start
             gpio_put(DEBUG_ALL_BEAMS_COMPLETE_PIN, 1);
