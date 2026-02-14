@@ -152,6 +152,8 @@ volatile int queue_write_idx = 0;
 volatile int queue_read_idx = 0;
 volatile int queue_count = 0;
 
+static spin_lock_t *beam_queue_lock;
+
 // Reverse queue: FFT results from Core 1 to Core 0 for I2C transmission
 // Core 1 produces FFT results, Core 0 consumes and transmits via I2C
 #define FFT_QUEUE_SIZE 5
@@ -166,96 +168,95 @@ volatile int fft_queue_write_idx = 0;
 volatile int fft_queue_read_idx = 0;
 volatile int fft_queue_count = 0;
 
+static spin_lock_t *fft_queue_lock;
+
 static bool queue_add_beamformed(uint16_t beam_data[NUM_BEAMS][CAPTURE_DEPTH]) {
-    // Non-blocking check: if queue full, give up immediately
+    uint32_t irq_state = spin_lock_blocking(beam_queue_lock);
     if (queue_count >= QUEUE_SIZE) {
+        spin_unlock(beam_queue_lock, irq_state);
         return false;
     }
-    
-    // Get current write index
+
     int write_idx = queue_write_idx;
-    
-    // Copy data (no lock, single writer Core 0)
+
+    // Copy data while locked to avoid consumer seeing partial writes
     for (int beam = 0; beam < NUM_BEAMS; beam++) {
         for (int i = 0; i < CAPTURE_DEPTH; i++) {
             beamform_queue[write_idx].beam_data[beam][i] = beam_data[beam][i];
         }
     }
     beamform_queue[write_idx].valid = true;
-    
-    // Update write index and count (Core 0 only) - simple increment instead of atomic
+
     queue_write_idx = (queue_write_idx + 1) % QUEUE_SIZE;
-    queue_count++;  // Simple increment
-    
+    queue_count++;
+
+    spin_unlock(beam_queue_lock, irq_state);
     return true;
 }
 
 static bool queue_get_beamformed(uint16_t beam_data[NUM_BEAMS][CAPTURE_DEPTH]) {
-    // Simple volatile check - no atomics
+    uint32_t irq_state = spin_lock_blocking(beam_queue_lock);
     if (queue_count == 0) {
-        return false;  // Queue empty
+        spin_unlock(beam_queue_lock, irq_state);
+        return false;
     }
-    
-    // Get current read index
+
     int read_idx = queue_read_idx;
-    
-    // Copy data
+
     for (int beam = 0; beam < NUM_BEAMS; beam++) {
         for (int i = 0; i < CAPTURE_DEPTH; i++) {
             beam_data[beam][i] = beamform_queue[read_idx].beam_data[beam][i];
         }
     }
     beamform_queue[read_idx].valid = false;
-    
-    // Update read index and count
+
     queue_read_idx = (queue_read_idx + 1) % QUEUE_SIZE;
-    queue_count--;  // Simple decrement instead of atomic
-    
+    queue_count--;
+
+    spin_unlock(beam_queue_lock, irq_state);
     return true;
 }
 
 // FFT result queue functions (Core 1 produces, Core 0 consumes)
 static bool fft_queue_add(int beam_idx, uint16_t *freq_bins) {
-    // Check if queue full
+    uint32_t irq_state = spin_lock_blocking(fft_queue_lock);
     if (fft_queue_count >= FFT_QUEUE_SIZE) {
+        spin_unlock(fft_queue_lock, irq_state);
         return false;
     }
-    
+
     int write_idx = fft_queue_write_idx;
-    
-    // Copy FFT result
     fft_result_queue[write_idx].beam_idx = beam_idx;
     for (int i = 0; i < NUM_FREQ_BINS; i++) {
         fft_result_queue[write_idx].freq_bins[i] = freq_bins[i];
     }
     fft_result_queue[write_idx].valid = true;
-    
-    // Update write index and count (Core 1 only)
+
     fft_queue_write_idx = (fft_queue_write_idx + 1) % FFT_QUEUE_SIZE;
     fft_queue_count++;
-    
+
+    spin_unlock(fft_queue_lock, irq_state);
     return true;
 }
 
 static bool fft_queue_get(int *beam_idx, uint16_t *freq_bins) {
-    // Check if queue empty
+    uint32_t irq_state = spin_lock_blocking(fft_queue_lock);
     if (fft_queue_count == 0) {
+        spin_unlock(fft_queue_lock, irq_state);
         return false;
     }
-    
+
     int read_idx = fft_queue_read_idx;
-    
-    // Copy FFT result
     *beam_idx = fft_result_queue[read_idx].beam_idx;
     for (int i = 0; i < NUM_FREQ_BINS; i++) {
         freq_bins[i] = fft_result_queue[read_idx].freq_bins[i];
     }
     fft_result_queue[read_idx].valid = false;
-    
-    // Update read index and count (Core 0 only)
+
     fft_queue_read_idx = (fft_queue_read_idx + 1) % FFT_QUEUE_SIZE;
     fft_queue_count--;
-    
+
+    spin_unlock(fft_queue_lock, irq_state);
     return true;
 }
 
@@ -801,6 +802,10 @@ int main()
     // USB serial output is enabled via stdio_init_all() above
     printf("Core 0: ADC Capture & Beamforming Started\n");
     fflush(stdout);
+
+    // Initialize inter-core queue locks
+    beam_queue_lock = spin_lock_instance(0);
+    fft_queue_lock = spin_lock_instance(1);
 
     // Initialize beamforming delays for all 5 angles
     init_beam_delays();
