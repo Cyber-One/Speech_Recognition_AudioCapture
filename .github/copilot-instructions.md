@@ -17,10 +17,10 @@ This is a **real-time audio beamforming and frequency analysis system** built on
 ### The Hardware Setup
 ```
 Microphone 1 -----> ADC Channel 0
-Microphone 2 -----> ADC Channel 1  (spaced 50mm apart)
+Microphone 2 -----> ADC Channel 1  (spaced 31mm apart)
 Microphone 3 -----> ADC Channel 2
 ```
-Three microphones are placed in a line, 50mm (about 2 inches) apart.
+Three microphones are placed in a line, 31mm (about 1.2 inches) apart.
 
 ### The Processing Pipeline (Simplified)
 1. **Capture**: Read microphone signals at 16 kHz (16,000 times per second) with 12-bit precision
@@ -108,7 +108,7 @@ The system splits work between **two CPU cores** for maximum performance with **
 ### Components
 
 **Analog Input Capture (ADC)**
-- 3 parallel ADC channels sample microphone signals
+- 3 ADC channels sampled in round-robin sequence (CH0→CH1→CH2)
 - Sample rate: 16 kHz (16,000 samples per second per channel)
 - **12-bit resolution** (0-4095 range) for optimal SNR and dynamic range
 - No byte-shift: preserves full ADC precision for FFT processing
@@ -209,6 +209,7 @@ picotool load build/Speech_Recognition_AudioCapture.uf2 -fx
 - ADC clock divider calculated to achieve target rate: 48 MHz / (3 × 16 kHz)
 - Free-running mode with DMA triggering
 - DMA configured for 16-bit transfers to match ADC FIFO width
+- Deterministic channel skew compensation in beam delay math: mic0=0, mic1=+1/3 sample, mic2=+2/3 sample
 
 ### Beamforming Algorithm
 1. Calculate time delay (in samples) for each microphone pair and angle
@@ -303,7 +304,7 @@ TARGET_SAMPLE_RATE      = 16000   // Hz
 CAPTURE_DEPTH           = 4096    // samples per buffer
 
 // Beamforming
-MIC_SPACING             = 0.05    // meters (50 mm)
+MIC_SPACING             = 0.031   // meters (31 mm)
 SPEED_OF_SOUND          = 343.0   // m/s at 20°C
 BEAM_ANGLES             = -60°, -30°, 0°, 30°, 60°
 

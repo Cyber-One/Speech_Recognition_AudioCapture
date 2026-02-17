@@ -51,7 +51,7 @@
 
 // Beamforming configuration
 #define SPEED_OF_SOUND 343.0f     // m/s at 20°C
-#define MIC_SPACING 0.05f         // 50mm spacing between microphones
+#define MIC_SPACING 0.031f        // 31mm spacing between microphones
 #define NUM_BEAMS 5               // 5 steered beams
 #define MAX_DELAY_SAMPLES ((int)(MIC_SPACING / SPEED_OF_SOUND * TARGET_SAMPLE_RATE) + 1)
 
@@ -278,15 +278,33 @@ static float calculate_delay_seconds(float angle, int mic_idx) {
     return delay_sec;
 }
 
+// ADC runs round-robin CH0->CH1->CH2 at 48k conversions/s.
+// At 16k samples/s/channel this creates fixed sampling skew:
+// mic0 = 0 samples, mic1 = +1/3 sample, mic2 = +2/3 sample (later in time).
+// Convert this deterministic skew into an equivalent per-channel time offset.
+static float calculate_adc_skew_seconds(int mic_idx) {
+    float skew_samples = (float)mic_idx / (float)ADC_NUM_CHANNELS;
+    return skew_samples / (float)TARGET_SAMPLE_RATE;
+}
+
+// Symmetric round-to-nearest for signed values (avoids truncation bias around 0)
+static int round_to_int(float x) {
+    return (x >= 0.0f) ? (int)(x + 0.5f) : (int)(x - 0.5f);
+}
+
 // Initialize beamforming delay indices for all angles
 static void init_beam_delays(void) {
     for (int beam = 0; beam < NUM_BEAMS; beam++) {
         float angle = beam_angles[beam];
         
         for (int mic = 0; mic < ADC_NUM_CHANNELS; mic++) {
-            float delay_sec = calculate_delay_seconds(angle, mic);
-            // Convert to sample delay (negative for delay)
-            int delay_samples = -(int)(delay_sec * TARGET_SAMPLE_RATE + 0.5f);
+            float steer_delay_sec = calculate_delay_seconds(angle, mic);
+            float adc_skew_sec = calculate_adc_skew_seconds(mic);
+
+            // Effective delay = steering geometry delay - deterministic ADC sampling skew
+            // Convert to integer sample shift for delay-and-sum indexing.
+            float effective_delay_samples = (steer_delay_sec - adc_skew_sec) * TARGET_SAMPLE_RATE;
+            int delay_samples = -round_to_int(effective_delay_samples);
             beam_delays[beam][mic] = delay_samples;
         }
     }

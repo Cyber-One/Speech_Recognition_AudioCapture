@@ -9,6 +9,7 @@ Real-time 3-microphone beamforming and frequency analysis system for Raspberry P
 This project implements a dual-core audio processing pipeline that:
 
 - Captures audio from 3 microphones at 16 kHz with 12-bit precision
+- Uses 31 mm microphone spacing (center-to-center, linear 3-mic array)
 - Performs delay-and-sum beamforming for 5 directional beams (-60°, -30°, 0°, +30°, +60°)
 - Computes 256-point FFT for frequency analysis (500-5500 Hz)
 - Transmits 40 frequency bins per beam via I2C to downstream processors (8-bit)
@@ -92,11 +93,41 @@ Each beam transmits a 41-byte packet:
 ## Performance Metrics
 
 - **Sample rate**: 16 kHz per channel
+- **Mic spacing**: 31 mm (adjacent microphones)
 - **ADC precision**: 12-bit (0-4095)
 - **FFT size**: 256 points
 - **Frequency range**: 500-5500 Hz (40 bins)
 - **Processing**: ~16ms per 5-beam cycle
 - **I2C throughput**: ~5ms for all beams @ 400 kHz
+
+## Beamforming Delay Model (Integer Math)
+
+The beamformer uses integer sample shifts, with two effects combined:
+
+- **Geometric steering delay** from microphone spacing and beam angle
+- **Fixed ADC round-robin skew** compensation for sequential channel sampling
+
+Round-robin ADC timing offset at 16 kHz/channel is:
+
+- Mic 0: 0 samples
+- Mic 1: +1/3 sample
+- Mic 2: +2/3 sample
+
+The implemented integer shift is computed as:
+
+$$
+\text{delay}[\text{beam},\text{mic}] = -\operatorname{round}\left(\left(\tau_{geom}-\tau_{skew}\right)f_s\right)
+$$
+
+With 31 mm spacing, this yields the following delay table (samples):
+
+| Beam angle | Mic 0 | Mic 1 | Mic 2 |
+|------------|-------|-------|-------|
+| -60°       | 0     | +2    | +3    |
+| -30°       | 0     | +1    | +2    |
+| 0°         | 0     | 0     | +1    |
+| +30°       | 0     | 0     | -1    |
+| +60°       | 0     | -1    | -2    |
 
 ## Debug & Monitoring
 
