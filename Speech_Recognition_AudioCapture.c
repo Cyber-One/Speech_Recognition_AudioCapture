@@ -109,6 +109,8 @@ static const float beam_angles[NUM_BEAMS] = {-60.0f, -30.0f, 0.0f, 30.0f, 60.0f}
 // Calculated delays in samples for each beam and microphone pair
 // Positive delay means shift the signal backward in time
 static int beam_delays[NUM_BEAMS][ADC_NUM_CHANNELS];
+// Runtime debug switch: enable/disable ADC round-robin skew compensation in beam delay math
+static bool beam_skew_comp_enabled = true;
 
 // DMA circular buffer (power-of-two sized to match ring, aligned for DMA)
 // Ring size = 2^15 = 32768 bytes, so buffer MUST be aligned to 32KB boundary
@@ -311,7 +313,7 @@ static void init_beam_delays(void) {
         
         for (int mic = 0; mic < ADC_NUM_CHANNELS; mic++) {
             float steer_delay_sec = calculate_delay_seconds(angle, mic);
-            float adc_skew_sec = calculate_adc_skew_seconds(mic);
+            float adc_skew_sec = beam_skew_comp_enabled ? calculate_adc_skew_seconds(mic) : 0.0f;
 
             // Effective delay = steering geometry delay - deterministic ADC sampling skew
             // Convert to integer sample shift for delay-and-sum indexing.
@@ -330,6 +332,35 @@ static void init_beam_delays(void) {
 static void extract_channel(int mic, uint16_t *adc_data, int num_samples, uint16_t *output) {
     for (int i = 0; i < num_samples; i++) {
         output[i] = adc_data[i * ADC_NUM_CHANNELS + mic];
+    }
+}
+
+// Extract the latest BLOCK_SAMPLES from the DMA ring and de-interleave into CH0/CH1/CH2.
+// Uses absolute sample phase so channel ordering remains correct even when ring wraps.
+static void extract_channels_from_ring(uint32_t end_pos_samples,
+                                       uint16_t *ch0_out,
+                                       uint16_t *ch1_out,
+                                       uint16_t *ch2_out) {
+    const uint32_t ring_mask = BUFFER_SIZE - 1;
+    uint32_t start_sample = end_pos_samples - BLOCK_SAMPLES;
+    uint32_t start_idx = start_sample & ring_mask;
+    uint32_t phase = start_sample % ADC_NUM_CHANNELS;  // 0=CH0,1=CH1,2=CH2
+
+    int idx0 = 0;
+    int idx1 = 0;
+    int idx2 = 0;
+
+    for (uint32_t i = 0; i < BLOCK_SAMPLES; i++) {
+        uint16_t v = adc_buffer[(start_idx + i) & ring_mask] & 0x0FFF;
+        uint32_t ch = (phase + i) % ADC_NUM_CHANNELS;
+
+        if (ch == 0) {
+            if (idx0 < CAPTURE_DEPTH) ch0_out[idx0++] = v;
+        } else if (ch == 1) {
+            if (idx1 < CAPTURE_DEPTH) ch1_out[idx1++] = v;
+        } else {
+            if (idx2 < CAPTURE_DEPTH) ch2_out[idx2++] = v;
+        }
     }
 }
 
@@ -371,6 +402,22 @@ static bool diag_beam_enabled = (RAW_ADC_DEBUG != 0);
 static bool diag_tone_enabled = (TONE_MONITOR_ENABLE != 0);
 static bool diag_i2c_error_log_enabled = (I2C_ERROR_SERIAL_LOG != 0);
 static volatile int tone_monitor_bin_idx_runtime = 0;
+// Runtime digital gain applied before FFT (Q15 conversion stage)
+static volatile int fft_input_gain = 6;
+static bool agc_enabled = true;
+// Runtime shift used when packing 16-bit FFT bins to 8-bit I2C payload
+// Smaller shift = more sensitive LCD response (speech visibility)
+static volatile int i2c_output_shift = 6;
+
+#define FFT_GAIN_MIN 1
+#define FFT_GAIN_MAX 64
+#define AGC_HEADROOM_Q15 ((int32_t)(32767 * 8 / 10))  // 80% of full-scale
+#define AGC_RAMP_UP_HOLD_MS 2500
+
+static volatile uint16_t agc_last_peak_q15 = 0;
+static volatile uint32_t agc_last_clip_ms = 0;
+static volatile uint32_t agc_stable_start_ms = 0;
+static volatile uint32_t agc_clip_events = 0;
 
 static bool parse_onoff(const char *s, bool *value_out) {
     if (!s || !value_out) return false;
@@ -401,11 +448,16 @@ static bool str_ieq(const char *a, const char *b) {
 }
 
 static void print_diag_status(void) {
-    printf("DIAG status: raw=%s beam=%s tone=%s i2c=%s bin=%d (~%.0f Hz)\n",
+    printf("DIAG status: raw=%s beam=%s tone=%s i2c=%s skew=%s agc=%s gain=%dx i2cShift=%d peak=%u bin=%d (~%.0f Hz)\n",
            diag_raw_enabled ? "ON" : "OFF",
            diag_beam_enabled ? "ON" : "OFF",
            diag_tone_enabled ? "ON" : "OFF",
            diag_i2c_error_log_enabled ? "ON" : "OFF",
+           beam_skew_comp_enabled ? "ON" : "OFF",
+           agc_enabled ? "ON" : "OFF",
+           fft_input_gain,
+           i2c_output_shift,
+           agc_last_peak_q15,
            tone_monitor_bin_idx_runtime,
            tone_monitor_hz_from_bin(tone_monitor_bin_idx_runtime));
 }
@@ -418,6 +470,10 @@ static void print_diag_help(void) {
     printf("  beam on|off          -> enable/disable BEAMFORMED table\n");
     printf("  tone on|off          -> enable/disable tone monitor line\n");
     printf("  i2c on|off           -> enable/disable I2C failure serial logs\n");
+    printf("  skew on|off          -> enable/disable ADC skew correction in beamforming\n");
+    printf("  agc on|off           -> enable/disable auto gain control\n");
+    printf("  gain N               -> set pre-FFT digital gain multiplier (1-64)\n");
+    printf("  i2cshift N           -> set 16->8 bit I2C pack shift (4-12, lower=more sensitive)\n");
     printf("  bin N                -> set tone monitor bin (0-%d)\n", NUM_FREQ_BINS - 1);
     printf("  N                    -> shorthand for bin N\n");
 }
@@ -464,6 +520,39 @@ static void process_diag_command(const char *cmd_buf) {
             printf("I2C failure logs: %s\n", diag_i2c_error_log_enabled ? "ON" : "OFF");
         } else {
             printf("Usage: i2c on|off\n");
+        }
+    } else if (sscanf(cmd_buf, "skew %15s", arg) == 1 || sscanf(cmd_buf, "SKEW %15s", arg) == 1) {
+        bool v;
+        if (parse_onoff(arg, &v)) {
+            beam_skew_comp_enabled = v;
+            init_beam_delays();
+            printf("Beamforming skew correction: %s\n", beam_skew_comp_enabled ? "ON" : "OFF");
+        } else {
+            printf("Usage: skew on|off\n");
+        }
+    } else if (sscanf(cmd_buf, "agc %15s", arg) == 1 || sscanf(cmd_buf, "AGC %15s", arg) == 1) {
+        bool v;
+        if (parse_onoff(arg, &v)) {
+            agc_enabled = v;
+            agc_stable_start_ms = to_ms_since_boot(get_absolute_time());
+            printf("Auto gain control: %s\n", agc_enabled ? "ON" : "OFF");
+        } else {
+            printf("Usage: agc on|off\n");
+        }
+    } else if (sscanf(cmd_buf, "gain %d", &new_bin) == 1 || sscanf(cmd_buf, "GAIN %d", &new_bin) == 1) {
+        if (new_bin >= FFT_GAIN_MIN && new_bin <= FFT_GAIN_MAX) {
+            fft_input_gain = new_bin;
+            agc_stable_start_ms = to_ms_since_boot(get_absolute_time());
+            printf("Pre-FFT digital gain set: %dx\n", fft_input_gain);
+        } else {
+            printf("Invalid gain: %d (valid range %d-%d)\n", new_bin, FFT_GAIN_MIN, FFT_GAIN_MAX);
+        }
+    } else if (sscanf(cmd_buf, "i2cshift %d", &new_bin) == 1 || sscanf(cmd_buf, "I2CSHIFT %d", &new_bin) == 1) {
+        if (new_bin >= 4 && new_bin <= 12) {
+            i2c_output_shift = new_bin;
+            printf("I2C output shift set: %d (lower = more sensitive)\n", i2c_output_shift);
+        } else {
+            printf("Invalid i2cshift: %d (valid range 4-12)\n", new_bin);
         }
     } else if (str_ieq(cmd_buf, "help") || str_ieq(cmd_buf, "h") || str_ieq(cmd_buf, "?")) {
         print_diag_help();
@@ -636,15 +725,60 @@ static void extract_freq_bins_fixed(uint16_t *magnitude, uint16_t *bins) {
 
 // Compute FFT for a single beamformed channel (fixed-point)
 static void compute_fft_spectrum(uint16_t *input, uint16_t *output) {
+    uint16_t local_peak_q15 = 0;
+    bool clipped = false;
+
     // Prepare input: convert to fixed-point Q15
     for (int i = 0; i < FFT_SIZE; i++) {
         // Beamformed output is uint16_t (0-4095 range from 12-bit ADC)
         // Convert to signed Q15: center around 0 and scale up
         // Range: 0-4095 → -2048 to +2047 → -32768 to +32752 in Q15
         int32_t centered = (int32_t)input[i] - 2048;
-        int16_t adc_q15 = (int16_t)(centered * 16);  // Scale by ~16 to use full Q15 range
+        int32_t scaled = centered * 16 * fft_input_gain;
+        if (scaled > 32767) {
+            scaled = 32767;
+            clipped = true;
+        }
+        if (scaled < -32768) {
+            scaled = -32768;
+            clipped = true;
+        }
+
+        uint16_t abs_q15 = (scaled < 0) ? (uint16_t)(-scaled) : (uint16_t)scaled;
+        if (abs_q15 > local_peak_q15) local_peak_q15 = abs_q15;
+
+        int16_t adc_q15 = (int16_t)scaled;
         fft_real[i] = adc_q15;
         fft_imag[i] = 0;
+    }
+
+    agc_last_peak_q15 = local_peak_q15;
+
+    if (agc_enabled) {
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
+        if (clipped) {
+            agc_clip_events++;
+            agc_last_clip_ms = now_ms;
+            agc_stable_start_ms = now_ms;
+            if (fft_input_gain > FFT_GAIN_MIN) {
+                fft_input_gain -= 1;
+            }
+        } else {
+            // Only consider ramp-up when we are below 80% full-scale.
+            if (local_peak_q15 <= AGC_HEADROOM_Q15) {
+                if (agc_stable_start_ms == 0) agc_stable_start_ms = now_ms;
+                if ((now_ms - agc_stable_start_ms) >= AGC_RAMP_UP_HOLD_MS) {
+                    if (fft_input_gain < FFT_GAIN_MAX) {
+                        fft_input_gain += 1;
+                    }
+                    agc_stable_start_ms = now_ms;
+                }
+            } else {
+                // We are already near full-scale; hold gain steady and restart stable timer.
+                agc_stable_start_ms = now_ms;
+            }
+        }
     }
     
     // Compute FFT
@@ -697,10 +831,12 @@ static void init_error_leds(void) {
 
 // Initialize debug timing GPIO pins
 static void init_debug_gpios(void) {
+static bool beam_skew_comp_enabled = true;
     // GPIO 5 for Core 1 heartbeat
     printf("Initializing GPIO 5...\n");
     fflush(stdout);
-    gpio_init(5);
+            diag_raw_enabled ? "ON" : "OFF",
+           beam_skew_comp_enabled ? "ON" : "OFF",
     printf("GPIO 5 initialized\n");
     fflush(stdout);
     gpio_set_dir(5, GPIO_OUT);
@@ -739,9 +875,12 @@ static void init_debug_gpios(void) {
 static void format_i2c_packet(uint16_t *freq_bins) {
     i2c_packet[0] = I2C_PACKET_HEADER;
     for (int i = 0; i < NUM_FREQ_BINS; i++) {
-        // Convert 16-bit magnitude to 8-bit by right shifting
+        // Convert 16-bit magnitude to 8-bit by right shifting.
+        // Runtime shift allows tuning speech visibility on downstream LCD.
         uint16_t val = freq_bins[i];
-        uint8_t out = (uint8_t)(val >> 8);
+        uint16_t packed = val >> i2c_output_shift;
+        if (packed > 255) packed = 255;
+        uint8_t out = (uint8_t)packed;
         i2c_packet[1 + i] = out;
     }
     // Debug: log packet formatting (first time only)
@@ -784,10 +923,10 @@ static bool send_fft_via_i2c(int beam_idx, uint16_t *freq_bins) {
         if (beam_idx < 5) {
             gpio_put(error_pins[beam_idx], 1);  // Turn ON LED to indicate failure
         }
-    if (diag_i2c_error_log_enabled) {
-        printf("I2C Beam %d (addr 0x%02x) failed: result=%d (expected %d)\n", beam_idx, slave_addr, result, I2C_PACKET_SIZE);
-        fflush(stdout);
-    }
+        if (diag_i2c_error_log_enabled) {
+            printf("I2C Beam %d (addr 0x%02x) failed: result=%d (expected %d)\n", beam_idx, slave_addr, result, I2C_PACKET_SIZE);
+            fflush(stdout);
+        }
         return false;
     }
 }
@@ -1111,10 +1250,8 @@ int main()
             // Blink GPIO 11 when we process data
             //gpio_put(DEBUG_ALL_BEAMS_COMPLETE_PIN, 1);
             
-            // Extract channels
-            extract_channel(0, adc_buffer, CAPTURE_DEPTH, ch0_data);
-            extract_channel(1, adc_buffer, CAPTURE_DEPTH, ch1_data);
-            extract_channel(2, adc_buffer, CAPTURE_DEPTH, ch2_data);
+            // Extract latest channels from DMA ring with correct phase handling.
+            extract_channels_from_ring(current_pos, ch0_data, ch1_data, ch2_data);
 
 #if RAW_ADC_DEBUG
             if ((core0_cycle_count % RAW_ADC_DEBUG_INTERVAL_CYCLES) == 0 && (diag_raw_enabled || diag_beam_enabled)) {
@@ -1128,6 +1265,11 @@ int main()
                     compute_adc_stats(ch2_data, CAPTURE_DEPTH, &ch_min[2], &ch_max[2], &ch_avg[2]);
 
                     printf("RAW ADC:\n");
+                    printf("  AGC:%s  GAIN:%2dx  PEAK:%5u  CLIPS:%lu\n",
+                           agc_enabled ? "ON " : "OFF",
+                           fft_input_gain,
+                           agc_last_peak_q15,
+                           (unsigned long)agc_clip_events);
                     printf("  CH   MIN(mV)   MAX(mV)   AVG(mV)   P2P(mV)\n");
                     for (int ch = 0; ch < ADC_NUM_CHANNELS; ch++) {
                         uint16_t p2p = ch_max[ch] - ch_min[ch];
@@ -1216,13 +1358,16 @@ int main()
                         }
                         if (max_mag == 0) max_mag = 1;
 
-                        printf("TONE %4dHz BIN%02d(~%.0fHz) | B0:%5u %3u%% B1:%5u %3u%% B2:%5u %3u%% B3:%5u %3u%% B4:%5u %3u%%\n",
+                           printf("TONE %4dHz BIN%02d(~%.0fHz) | B0:%5u %3u%% B1:%5u %3u%% B2:%5u %3u%% B3:%5u %3u%% B4:%5u %3u%% | AGC:%s G:%dx P:%u\n",
                                (int)tone_monitor_hz_from_bin(tone_bin_idx), tone_bin_idx, tone_monitor_hz_from_bin(tone_bin_idx),
                                tone_mag[0], (uint16_t)((tone_mag[0] * 100u) / max_mag),
                                tone_mag[1], (uint16_t)((tone_mag[1] * 100u) / max_mag),
                                tone_mag[2], (uint16_t)((tone_mag[2] * 100u) / max_mag),
                                tone_mag[3], (uint16_t)((tone_mag[3] * 100u) / max_mag),
-                               tone_mag[4], (uint16_t)((tone_mag[4] * 100u) / max_mag));
+                               tone_mag[4], (uint16_t)((tone_mag[4] * 100u) / max_mag),
+                               agc_enabled ? "ON" : "OFF",
+                               fft_input_gain,
+                               agc_last_peak_q15);
                         fflush(stdout);
                     }
                 }

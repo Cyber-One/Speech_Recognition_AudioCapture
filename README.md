@@ -177,7 +177,15 @@ You can enable/disable debug streams at runtime without reflashing:
 - `beam on|off` → show/hide BEAMFORMED table
 - `tone on|off` → show/hide tone monitor line
 - `i2c on|off` → show/hide I2C failure log prints
+- `skew on|off` → enable/disable ADC round-robin skew correction in beamforming
+- `agc on|off` → enable/disable auto gain control (clip down / slow up)
+- `gain N` → set digital pre-FFT gain multiplier (`1..64`)
+- `i2cshift N` → set 16-bit to 8-bit I2C packing shift (`4..12`, lower = more sensitive)
 - `bin N` or just `N` → set tone-monitor FFT bin (`0..39`)
+
+AGC behavior (when `agc on`):
+- If clipping is detected in a frame, gain drops by `1` immediately.
+- If no clipping occurs and peak stays below ~`80%` full-scale for about `2.5s`, gain increases by `1`.
 
 Useful tone bin examples:
 
