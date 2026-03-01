@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/stdio_usb.h"
@@ -40,6 +41,16 @@
 #define ADC_CHANNEL_0 0
 #define ADC_CHANNEL_1 1
 #define ADC_CHANNEL_2 2
+
+// Raw ADC debug monitor (prints what Pico actually sees at ADC inputs)
+#define RAW_ADC_DEBUG 1
+#define RAW_ADC_DEBUG_INTERVAL_CYCLES 62  // ~1 second at 16ms processing cycles
+
+// Narrowband tone monitor (uses FFT bin magnitudes for beam direction testing)
+// Set frequency to test sweep behavior (e.g. 1000, 2000, 4000 Hz)
+#define TONE_MONITOR_ENABLE 1
+#define TONE_MONITOR_FREQ_HZ 1000
+#define TONE_MONITOR_INTERVAL_SETS 62      // print roughly once per second
 
 // Sample rate configuration
 #define TARGET_SAMPLE_RATE 16000  // 16 kHz for speech recognition
@@ -133,6 +144,7 @@ static uint16_t local_beam_output[NUM_BEAMS][CAPTURE_DEPTH];
 // I2C packet format: 1 byte header + 40 bins * 1 byte (40 bytes) = 41 bytes total
 #define I2C_PACKET_HEADER 0xAA    // Packet header for identification
 #define I2C_PACKET_SIZE 41        // Header (1) + FFT bins (40)
+#define I2C_ERROR_SERIAL_LOG 0    // 0 = suppress per-failure serial spam, 1 = print failures
 
 // USB Serial output (via stdio_init_all in main)
 
@@ -318,6 +330,182 @@ static void init_beam_delays(void) {
 static void extract_channel(int mic, uint16_t *adc_data, int num_samples, uint16_t *output) {
     for (int i = 0; i < num_samples; i++) {
         output[i] = adc_data[i * ADC_NUM_CHANNELS + mic];
+    }
+}
+
+static inline float adc_counts_to_millivolts(uint16_t counts) {
+    return ((float)counts * 3300.0f) / 4095.0f;
+}
+
+static void compute_adc_stats(uint16_t *samples, int num_samples, uint16_t *min_val, uint16_t *max_val, uint16_t *avg_val) {
+    uint16_t local_min = 0x0FFF;
+    uint16_t local_max = 0;
+    uint32_t sum = 0;
+    for (int i = 0; i < num_samples; i++) {
+        uint16_t v = samples[i] & 0x0FFF;
+        if (v < local_min) local_min = v;
+        if (v > local_max) local_max = v;
+        sum += v;
+    }
+    *min_val = local_min;
+    *max_val = local_max;
+    *avg_val = (uint16_t)(sum / (uint32_t)num_samples);
+}
+
+static int tone_monitor_bin_from_freq(int freq_hz) {
+    float relative = ((float)freq_hz - (float)FREQ_MIN) / BIN_WIDTH;
+    int idx = (int)(relative + 0.5f);
+    if (idx < 0) idx = 0;
+    if (idx >= NUM_FREQ_BINS) idx = NUM_FREQ_BINS - 1;
+    return idx;
+}
+
+static float tone_monitor_hz_from_bin(int bin_idx) {
+    if (bin_idx < 0) bin_idx = 0;
+    if (bin_idx >= NUM_FREQ_BINS) bin_idx = NUM_FREQ_BINS - 1;
+    return (float)FREQ_MIN + (BIN_WIDTH * (float)bin_idx);
+}
+
+static bool diag_raw_enabled = (RAW_ADC_DEBUG != 0);
+static bool diag_beam_enabled = (RAW_ADC_DEBUG != 0);
+static bool diag_tone_enabled = (TONE_MONITOR_ENABLE != 0);
+static bool diag_i2c_error_log_enabled = (I2C_ERROR_SERIAL_LOG != 0);
+static volatile int tone_monitor_bin_idx_runtime = 0;
+
+static bool parse_onoff(const char *s, bool *value_out) {
+    if (!s || !value_out) return false;
+    if ((s[0] == '1' && s[1] == '\0') ||
+        ((s[0] == 'o' || s[0] == 'O') && (s[1] == 'n' || s[1] == 'N') && s[2] == '\0')) {
+        *value_out = true;
+        return true;
+    }
+    if ((s[0] == '0' && s[1] == '\0') ||
+        ((s[0] == 'o' || s[0] == 'O') && (s[1] == 'f' || s[1] == 'F') && (s[2] == 'f' || s[2] == 'F') && s[3] == '\0')) {
+        *value_out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool str_ieq(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
+static void print_diag_status(void) {
+    printf("DIAG status: raw=%s beam=%s tone=%s i2c=%s bin=%d (~%.0f Hz)\n",
+           diag_raw_enabled ? "ON" : "OFF",
+           diag_beam_enabled ? "ON" : "OFF",
+           diag_tone_enabled ? "ON" : "OFF",
+           diag_i2c_error_log_enabled ? "ON" : "OFF",
+           tone_monitor_bin_idx_runtime,
+           tone_monitor_hz_from_bin(tone_monitor_bin_idx_runtime));
+}
+
+static void print_diag_help(void) {
+    printf("DIAG commands:\n");
+    printf("  help                 -> show this help\n");
+    printf("  status               -> show current diagnostic mode status\n");
+    printf("  raw on|off           -> enable/disable RAW ADC table\n");
+    printf("  beam on|off          -> enable/disable BEAMFORMED table\n");
+    printf("  tone on|off          -> enable/disable tone monitor line\n");
+    printf("  i2c on|off           -> enable/disable I2C failure serial logs\n");
+    printf("  bin N                -> set tone monitor bin (0-%d)\n", NUM_FREQ_BINS - 1);
+    printf("  N                    -> shorthand for bin N\n");
+}
+
+static void process_diag_command(const char *cmd_buf) {
+    char arg[16] = {0};
+    int new_bin = -1;
+
+    if (sscanf(cmd_buf, "%d", &new_bin) == 1 || sscanf(cmd_buf, "bin %d", &new_bin) == 1 || sscanf(cmd_buf, "BIN %d", &new_bin) == 1) {
+        if (new_bin >= 0 && new_bin < NUM_FREQ_BINS) {
+            tone_monitor_bin_idx_runtime = new_bin;
+            printf("Tone monitor bin set: %d (~%.0f Hz)\n", new_bin, tone_monitor_hz_from_bin(new_bin));
+        } else {
+            printf("Invalid bin: %d (valid range 0-%d)\n", new_bin, NUM_FREQ_BINS - 1);
+        }
+    } else if (sscanf(cmd_buf, "raw %15s", arg) == 1 || sscanf(cmd_buf, "RAW %15s", arg) == 1) {
+        bool v;
+        if (parse_onoff(arg, &v)) {
+            diag_raw_enabled = v;
+            printf("RAW ADC diagnostics: %s\n", diag_raw_enabled ? "ON" : "OFF");
+        } else {
+            printf("Usage: raw on|off\n");
+        }
+    } else if (sscanf(cmd_buf, "beam %15s", arg) == 1 || sscanf(cmd_buf, "BEAM %15s", arg) == 1) {
+        bool v;
+        if (parse_onoff(arg, &v)) {
+            diag_beam_enabled = v;
+            printf("BEAMFORMED diagnostics: %s\n", diag_beam_enabled ? "ON" : "OFF");
+        } else {
+            printf("Usage: beam on|off\n");
+        }
+    } else if (sscanf(cmd_buf, "tone %15s", arg) == 1 || sscanf(cmd_buf, "TONE %15s", arg) == 1) {
+        bool v;
+        if (parse_onoff(arg, &v)) {
+            diag_tone_enabled = v;
+            printf("Tone monitor: %s\n", diag_tone_enabled ? "ON" : "OFF");
+        } else {
+            printf("Usage: tone on|off\n");
+        }
+    } else if (sscanf(cmd_buf, "i2c %15s", arg) == 1 || sscanf(cmd_buf, "I2C %15s", arg) == 1) {
+        bool v;
+        if (parse_onoff(arg, &v)) {
+            diag_i2c_error_log_enabled = v;
+            printf("I2C failure logs: %s\n", diag_i2c_error_log_enabled ? "ON" : "OFF");
+        } else {
+            printf("Usage: i2c on|off\n");
+        }
+    } else if (str_ieq(cmd_buf, "help") || str_ieq(cmd_buf, "h") || str_ieq(cmd_buf, "?")) {
+        print_diag_help();
+    } else if (str_ieq(cmd_buf, "status") || str_ieq(cmd_buf, "st")) {
+        print_diag_status();
+    } else {
+        printf("Unknown command: %s\n", cmd_buf);
+        print_diag_help();
+    }
+    fflush(stdout);
+}
+
+static void tone_monitor_poll_serial_commands(void) {
+    static char cmd_buf[32];
+    static int cmd_len = 0;
+    static uint32_t last_char_ms = 0;
+    const uint32_t CMD_IDLE_EXECUTE_MS = 120;
+
+    int ch;
+    while ((ch = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
+        if (ch == '\r' || ch == '\n') {
+            if (cmd_len > 0) {
+                cmd_buf[cmd_len] = '\0';
+                process_diag_command(cmd_buf);
+                cmd_len = 0;
+            }
+        } else if (ch >= 32 && ch <= 126) {
+            if (cmd_len < (int)(sizeof(cmd_buf) - 1)) {
+                cmd_buf[cmd_len++] = (char)ch;
+            }
+            last_char_ms = to_ms_since_boot(get_absolute_time());
+        }
+    }
+
+    // Some serial terminals send text without CR/LF; execute after short idle gap.
+    if (cmd_len > 0) {
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if ((now_ms - last_char_ms) > CMD_IDLE_EXECUTE_MS) {
+            cmd_buf[cmd_len] = '\0';
+            process_diag_command(cmd_buf);
+            cmd_len = 0;
+        }
     }
 }
 
@@ -596,9 +784,10 @@ static bool send_fft_via_i2c(int beam_idx, uint16_t *freq_bins) {
         if (beam_idx < 5) {
             gpio_put(error_pins[beam_idx], 1);  // Turn ON LED to indicate failure
         }
-        // Debug: print I2C error to serial
+    if (diag_i2c_error_log_enabled) {
         printf("I2C Beam %d (addr 0x%02x) failed: result=%d (expected %d)\n", beam_idx, slave_addr, result, I2C_PACKET_SIZE);
         fflush(stdout);
+    }
         return false;
     }
 }
@@ -661,15 +850,24 @@ static void beamform_delay_sum(int beam_idx, uint16_t *ch0, uint16_t *ch1, uint1
         for (int mic = 0; mic < ADC_NUM_CHANNELS; mic++) {
             int delay = beam_delays[beam_idx][mic];
             int idx = i + delay;
-            
-            // Clamp to valid range
-            if (idx >= 0 && idx < num_samples) {
-                sum += (int32_t)channels[mic][idx];
+
+            // Edge-safe delay: clamp index instead of dropping samples to zero.
+            // Dropping out-of-range samples causes artificial low values at block edges,
+            // which inflates p2p and distorts beam statistics.
+            if (idx < 0) {
+                idx = 0;
+            } else if (idx >= num_samples) {
+                idx = num_samples - 1;
             }
+
+            sum += (int32_t)channels[mic][idx];
         }
-        
-        // Average across 3 channels and store
-        output[i] = (uint16_t)((sum / 3) & 0xFFF);
+
+        // Average across 3 channels and clamp to 12-bit ADC range.
+        int32_t avg = sum / ADC_NUM_CHANNELS;
+        if (avg < 0) avg = 0;
+        if (avg > 4095) avg = 4095;
+        output[i] = (uint16_t)avg;
     }
 }
 
@@ -869,10 +1067,33 @@ int main()
     uint32_t core0_cycle_count = 0;
     uint32_t heartbeat_counter = 0;
     uint32_t initial_transfer_count = 0xFFFFFFFFu;  // Track how much DMA has done
+
+#if TONE_MONITOR_ENABLE
+    uint16_t tone_mag[NUM_BEAMS] = {0};
+    uint8_t tone_seen_mask = 0;
+    uint32_t tone_set_count = 0;
+    tone_monitor_bin_idx_runtime = tone_monitor_bin_from_freq(TONE_MONITOR_FREQ_HZ);
+#endif
     
     // Simple busy-wait loop - check DMA position continuously
     uint32_t log_counter = 0;
+
+#if TONE_MONITOR_ENABLE
+    printf("Tone monitor enabled: target=%d Hz, bin=%d (~%.0f Hz), interval=%d sets\n",
+           TONE_MONITOR_FREQ_HZ,
+           tone_monitor_bin_idx_runtime,
+           tone_monitor_hz_from_bin(tone_monitor_bin_idx_runtime),
+           TONE_MONITOR_INTERVAL_SETS);
+    print_diag_help();
+    print_diag_status();
+    fflush(stdout);
+#endif
+
     while (true) {
+#if TONE_MONITOR_ENABLE
+        tone_monitor_poll_serial_commands();
+#endif
+
         // Check if new data is available (every CAPTURE_DEPTH samples)
         uint32_t remaining = dma_hw->ch[g_dma_chan].transfer_count;
         uint32_t current_pos = initial_transfer_count - remaining;
@@ -894,6 +1115,37 @@ int main()
             extract_channel(0, adc_buffer, CAPTURE_DEPTH, ch0_data);
             extract_channel(1, adc_buffer, CAPTURE_DEPTH, ch1_data);
             extract_channel(2, adc_buffer, CAPTURE_DEPTH, ch2_data);
+
+#if RAW_ADC_DEBUG
+            if ((core0_cycle_count % RAW_ADC_DEBUG_INTERVAL_CYCLES) == 0 && (diag_raw_enabled || diag_beam_enabled)) {
+                uint16_t ch_min[ADC_NUM_CHANNELS];
+                uint16_t ch_max[ADC_NUM_CHANNELS];
+                uint16_t ch_avg[ADC_NUM_CHANNELS];
+
+                if (diag_raw_enabled) {
+                    compute_adc_stats(ch0_data, CAPTURE_DEPTH, &ch_min[0], &ch_max[0], &ch_avg[0]);
+                    compute_adc_stats(ch1_data, CAPTURE_DEPTH, &ch_min[1], &ch_max[1], &ch_avg[1]);
+                    compute_adc_stats(ch2_data, CAPTURE_DEPTH, &ch_min[2], &ch_max[2], &ch_avg[2]);
+
+                    printf("RAW ADC:\n");
+                    printf("  CH   MIN(mV)   MAX(mV)   AVG(mV)   P2P(mV)\n");
+                    for (int ch = 0; ch < ADC_NUM_CHANNELS; ch++) {
+                        uint16_t p2p = ch_max[ch] - ch_min[ch];
+                        float min_mv = adc_counts_to_millivolts(ch_min[ch]);
+                        float max_mv = adc_counts_to_millivolts(ch_max[ch]);
+                        float avg_mv = adc_counts_to_millivolts(ch_avg[ch]);
+                        float p2p_mv = adc_counts_to_millivolts(p2p);
+                        printf("  CH%-1d %9.1f %9.1f %9.1f %9.1f\n",
+                               ch,
+                               min_mv,
+                               max_mv,
+                               avg_mv,
+                               p2p_mv);
+                    }
+                }
+                fflush(stdout);
+            }
+#endif
             
             // Beamform all 5 beams
             for (int beam = 0; beam < NUM_BEAMS; beam++) {
@@ -903,6 +1155,35 @@ int main()
                 sleep_us(5);
                 gpio_put(5, 0);
             }
+
+#if RAW_ADC_DEBUG
+            if ((core0_cycle_count % RAW_ADC_DEBUG_INTERVAL_CYCLES) == 0 && diag_beam_enabled) {
+                uint16_t beam_min[NUM_BEAMS];
+                uint16_t beam_max[NUM_BEAMS];
+                uint16_t beam_avg[NUM_BEAMS];
+
+                for (int beam = 0; beam < NUM_BEAMS; beam++) {
+                    compute_adc_stats(local_beam_output[beam], CAPTURE_DEPTH, &beam_min[beam], &beam_max[beam], &beam_avg[beam]);
+                }
+
+                printf("BEAMFORMED:\n");
+                printf("  B   ANGLE    MIN(mV)   MAX(mV)   AVG(mV)   P2P(mV)\n");
+                for (int beam = 0; beam < NUM_BEAMS; beam++) {
+                    uint16_t p2p = beam_max[beam] - beam_min[beam];
+                    float min_mv = adc_counts_to_millivolts(beam_min[beam]);
+                    float max_mv = adc_counts_to_millivolts(beam_max[beam]);
+                    float avg_mv = adc_counts_to_millivolts(beam_avg[beam]);
+                    float p2p_mv = adc_counts_to_millivolts(p2p);
+                    printf("  B%-1d %7.0f %9.1f %9.1f %9.1f %9.1f\n",
+                           beam, beam_angles[beam],
+                           min_mv,
+                           max_mv,
+                           avg_mv,
+                           p2p_mv);
+                }
+                fflush(stdout);
+            }
+#endif
             
             // Queue beamformed data for Core 1 to process
             queue_add_beamformed(local_beam_output);
@@ -917,6 +1198,36 @@ int main()
         if (fft_queue_get(&beam_idx, freq_bins)) {
             // Transmit this beam's FFT result via I2C
             send_fft_via_i2c(beam_idx, freq_bins);
+
+#if TONE_MONITOR_ENABLE
+            if (diag_tone_enabled && beam_idx >= 0 && beam_idx < NUM_BEAMS) {
+                int tone_bin_idx = tone_monitor_bin_idx_runtime;
+                tone_mag[beam_idx] = freq_bins[tone_bin_idx];
+                tone_seen_mask |= (uint8_t)(1u << beam_idx);
+
+                if (tone_seen_mask == ((1u << NUM_BEAMS) - 1u)) {
+                    tone_seen_mask = 0;
+                    tone_set_count++;
+
+                    if ((tone_set_count % TONE_MONITOR_INTERVAL_SETS) == 0) {
+                        uint16_t max_mag = tone_mag[0];
+                        for (int b = 1; b < NUM_BEAMS; b++) {
+                            if (tone_mag[b] > max_mag) max_mag = tone_mag[b];
+                        }
+                        if (max_mag == 0) max_mag = 1;
+
+                        printf("TONE %4dHz BIN%02d(~%.0fHz) | B0:%5u %3u%% B1:%5u %3u%% B2:%5u %3u%% B3:%5u %3u%% B4:%5u %3u%%\n",
+                               (int)tone_monitor_hz_from_bin(tone_bin_idx), tone_bin_idx, tone_monitor_hz_from_bin(tone_bin_idx),
+                               tone_mag[0], (uint16_t)((tone_mag[0] * 100u) / max_mag),
+                               tone_mag[1], (uint16_t)((tone_mag[1] * 100u) / max_mag),
+                               tone_mag[2], (uint16_t)((tone_mag[2] * 100u) / max_mag),
+                               tone_mag[3], (uint16_t)((tone_mag[3] * 100u) / max_mag),
+                               tone_mag[4], (uint16_t)((tone_mag[4] * 100u) / max_mag));
+                        fflush(stdout);
+                    }
+                }
+            }
+#endif
         }
     }
 }

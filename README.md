@@ -116,7 +116,7 @@ Round-robin ADC timing offset at 16 kHz/channel is:
 The implemented integer shift is computed as:
 
 $$
-\text{delay}[\text{beam},\text{mic}] = -\operatorname{round}\left(\left(\tau_{geom}-\tau_{skew}\right)f_s\right)
+	ext{delay}[\text{beam},\text{mic}] = -\mathrm{round}\left(\left(\tau_{geom}-\tau_{skew}\right)f_s\right)
 $$
 
 With 31 mm spacing, this yields the following delay table (samples):
@@ -128,6 +128,30 @@ With 31 mm spacing, this yields the following delay table (samples):
 | 0°         | 0     | 0     | +1    |
 | +30°       | 0     | 0     | -1    |
 | +60°       | 0     | -1    | -2    |
+
+### Geometric-Only vs Skew-Compensated Delays
+
+If you ignore ADC round-robin skew, a beginner intuition is often:
+
+| Beam angle | Mic 0 | Mic 1 | Mic 2 |
+|------------|-------|-------|-------|
+| -60°       | 0     | +2    | +3    |
+| -30°       | 0     | +1    | +2    |
+| 0°         | 0     | 0     | 0     |
+| +30°       | 0     | -1    | -2    |
+| +60°       | 0     | -2    | -3    |
+
+The firmware table differs because it compensates the deterministic ADC channel skew (CH1 sampled +1/3 sample later than CH0, CH2 sampled +2/3 sample later than CH0).
+
+### Equivalent Angle Shift from ADC Skew
+
+At this geometry ($d=31\text{ mm}$, $f_s=16\text{ kHz}$), a $1/3$ sample timing offset is roughly equivalent to a steering offset of about $13^\circ$:
+
+$$
+\sin(\theta_{eq}) \approx \frac{(1/3)}{(d\,f_s/c)} = \frac{1/3}{1.446} \Rightarrow \theta_{eq}\approx 13.3^\circ
+$$
+
+So the skew term effectively shifts the integer-delay solution by about $\pm13^\circ$ unless compensated (which this firmware does).
 
 ## Debug & Monitoring
 
@@ -142,6 +166,45 @@ With 31 mm spacing, this yields the following delay table (samples):
 - Core 0/1 status messages
 - Queue full warnings
 - Cycle counters
+
+### Runtime Serial Diagnostic Commands (Beginner)
+
+You can enable/disable debug streams at runtime without reflashing:
+
+- `help` → show command list
+- `status` → show current mode states
+- `raw on|off` → show/hide RAW ADC table
+- `beam on|off` → show/hide BEAMFORMED table
+- `tone on|off` → show/hide tone monitor line
+- `i2c on|off` → show/hide I2C failure log prints
+- `bin N` or just `N` → set tone-monitor FFT bin (`0..39`)
+
+Useful tone bin examples:
+
+- `bin 4`  → ~1000 Hz
+- `bin 12` → ~2000 Hz
+- `bin 28` → ~4000 Hz
+
+Approximate mapping:
+
+$$f_{bin}(n)\approx 500+125n\text{ Hz}$$
+
+### Expected RAW ADC Values (What "Good" Looks Like)
+
+For correctly biased single-supply microphone signals into RP2040 ADC:
+
+- `AVG(mV)` for CH0/CH1/CH2 should be near mid-rail (typically ~1600–1700 mV)
+- `MIN(mV)` should stay above 0 mV
+- `MAX(mV)` should stay below 3300 mV
+- `P2P(mV)` should increase clearly when tone/speech is present
+
+Why these limits matter:
+
+- RP2040 ADC input range is 0–3.3 V (no negative input range)
+- Signals outside this range clip and distort beamforming/FFT
+- See RP2040 datasheet (ADC/electrical limits) and Raspberry Pi Pico datasheet (board electrical characteristics)
+
+If `AVG(mV)` is far from ~1.65 V, adjust analog bias network before tuning beamforming.
 
 ## How it works (summary)
 
